@@ -1,0 +1,30 @@
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# Environment variables
+.env
+
+# VSCode settings
+.vscode/
+*.code-workspace
+
+# Mac & Linux junk files
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Streamlit cache
+.streamlit/
