@@ -28,3 +28,4 @@ env/
 
 # Streamlit cache
 .streamlit/
+emd.py
