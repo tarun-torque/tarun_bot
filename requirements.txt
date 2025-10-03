@@ -1,6 +1,7 @@
 fastapi==0.116.1
 pydantic==2.11.9
 uvicorn==0.35.0
+mangum
 langchain-community==0.3.29
 qdrant-client==1.15.1
 langchain-huggingface==0.3.1
