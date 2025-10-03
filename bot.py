@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from langchain_community.vectorstores import Qdrant
-from langchain_huggingface import HuggingFaceEmbeddings
 from google import genai
 from google.genai import types, errors
 import os, time, logging
@@ -21,15 +20,32 @@ COLLECTION_NAME = "doctor_bot"
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- Qdrant setup ----------------
+# ---------------- Qdrant client setup ----------------
 try:
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 except Exception as e:
-    logging.error("Error initializing Qdrant:", e)
+    logging.error("Error initializing Qdrant client:", e)
     raise e
+
+# ---------------- Lazy-load embeddings and retriever ----------------
+embeddings = None
+vectorstore = None
+retriever = None
+
+def get_retriever():
+    """
+    Lazy-load HuggingFaceEmbeddings and Qdrant retriever.
+    Only loads embeddings the first time this function is called.
+    """
+    global embeddings, vectorstore, retriever
+    if retriever is None:
+        logging.info("Loading HuggingFaceEmbeddings model...")
+        from langchain_huggingface import HuggingFaceEmbeddings
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        logging.info("Embeddings loaded successfully.")
+    return retriever
 
 # ---------------- Gemini setup ----------------
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -41,7 +57,7 @@ def ask_gemini_with_retry(prompt: str, retries=3, delay=2) -> str:
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=20)  # increased budget
+                    thinking_config=types.ThinkingConfig(thinking_budget=20)
                 ),
             )
             return response.text.strip()
@@ -58,7 +74,7 @@ app = FastAPI(title="TarunBot API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,8 +92,9 @@ def home():
 @app.post("/ask")
 def ask_bot(query: Query):
     try:
-        # Retrieve context
-        docs = retriever.get_relevant_documents(query.question)
+        # Lazy-load retriever
+        retriever_instance = get_retriever()
+        docs = retriever_instance.get_relevant_documents(query.question)
         context = "\n".join([d.page_content for d in docs]) if docs else ""
 
         # Prepare Gemini prompt
