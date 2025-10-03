@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from langchain_community.vectorstores import Qdrant
 from google import genai
-from google.genai import types, errors
+from google.genai import types
 import os, time, logging
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +25,7 @@ try:
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 except Exception as e:
     logging.error("Error initializing Qdrant client:", e)
-    raise e
+    client = None  # continue, but retriever will fail
 
 # ---------------- Lazy-load embeddings and retriever ----------------
 embeddings = None
@@ -33,18 +33,21 @@ vectorstore = None
 retriever = None
 
 def get_retriever():
-    """
-    Lazy-load HuggingFaceEmbeddings and Qdrant retriever.
-    Only loads embeddings the first time this function is called.
-    """
     global embeddings, vectorstore, retriever
     if retriever is None:
-        logging.info("Loading HuggingFaceEmbeddings model...")
-        from langchain_huggingface import HuggingFaceEmbeddings
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-        logging.info("Embeddings loaded successfully.")
+        if client is None:
+            logging.error("Qdrant client not initialized, cannot create retriever.")
+            return None
+        try:
+            logging.info("Loading HuggingFaceEmbeddings model...")
+            from langchain_huggingface import HuggingFaceEmbeddings
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            logging.info("Embeddings loaded successfully.")
+        except Exception as e:
+            logging.error(f"Failed to initialize embeddings/retriever: {e}")
+            return None
     return retriever
 
 # ---------------- Gemini setup ----------------
@@ -92,12 +95,19 @@ def home():
 @app.post("/ask")
 def ask_bot(query: Query):
     try:
-        # Lazy-load retriever
         retriever_instance = get_retriever()
+        if retriever_instance is None:
+            return {"answer": {
+                "greeting": "Hello!",
+                "possible_causes": "",
+                "self_care": "",
+                "when_to_see_doctor": "⚠️ Retriever not available. Please try again later.",
+                "closing": "Regards, AI Doctor Assistant"
+            }}
+
         docs = retriever_instance.get_relevant_documents(query.question)
         context = "\n".join([d.page_content for d in docs]) if docs else ""
 
-        # Prepare Gemini prompt
         gemini_prompt = f"""
 You are an AI Doctor Assistant developed by Tarun.
 Answer the user’s medical question in a safe, non-prescriptive way.
@@ -123,7 +133,6 @@ Answer in JSON format if possible. If not, just give text.
 
         answer = ask_gemini_with_retry(gemini_prompt)
 
-        # Try parsing JSON, fallback if invalid
         try:
             answer_json = json.loads(answer)
         except json.JSONDecodeError:
