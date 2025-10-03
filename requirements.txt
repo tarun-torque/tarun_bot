@@ -4,6 +4,5 @@ uvicorn==0.35.0
 mangum
 langchain-community==0.3.29
 qdrant-client==1.15.1
-langchain-huggingface==0.3.1
 python-dotenv==1.1.1
 google-genai==1.36.0
