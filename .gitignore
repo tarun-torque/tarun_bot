@@ -29,3 +29,4 @@ env/
 # Streamlit cache
 .streamlit/
 emd.py
+botCopy.py
