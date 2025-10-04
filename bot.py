@@ -1,4 +1,15 @@
 # api.py
+"""
+Render-safe TarunBot API with guaranteed /ask responses.
+
+Behavior:
+- Lazy initialization of Gemini and Qdrant clients.
+- Blocking SDK calls run in a thread via asyncio.to_thread.
+- Strict concurrency via asyncio.Semaphore (env: MAX_CONCURRENT_REQUESTS).
+- If concurrency slot is unavailable immediately, return cached answer (if present) or a safe fallback JSON.
+- Caches last N answers (LRU) to increase chance of returning useful content when busy.
+- Provides /healthz and /memory endpoints.
+"""
 import os
 import time
 import json
@@ -6,31 +17,37 @@ import logging
 import threading
 import asyncio
 from typing import List, Union, Any
+from collections import OrderedDict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# ---------------- Load environment variables ----------------
+# ---------------- Config ----------------
 load_dotenv()
+PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "10000")))
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "doctor_bot")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "8"))
+
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1"))  # keep 1 on tiny instances
+SEMAPHORE_WAIT_SECONDS = float(os.getenv("SEMAPHORE_WAIT_SECONDS", "0.001"))  # immediate attempt
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "1"))
 RETRIEVER_K = int(os.getenv("RETRIEVER_K", "3"))
+
+CACHE_SIZE = int(os.getenv("ANSWER_CACHE_SIZE", "128"))  # LRU cache size for previously answered questions
 ENABLE_TRACEMALLOC = os.getenv("ENABLE_TRACEMALLOC", "0") == "1"
-TRACEMALLOC_LIMIT = int(os.getenv("TRACEMALLOC_LIMIT_BYTES", str(25 * 1024 * 1024)))  # default 25MB
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tarunbot")
 
-# ---------------- Module-level cache + locks ----------------
+# ---------------- App state ----------------
 _init_lock = threading.Lock()
 _services_initialized = False
 _services = {
@@ -44,23 +61,38 @@ _services = {
     "tracemalloc_enabled": False,
 }
 
-# ---------------- Helper: extract vector ----------------
+# Simple LRU cache for answers: key=question (string), value=dict(answer_json)
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.od = OrderedDict()
+
+    def get(self, key: str):
+        if key in self.od:
+            val = self.od.pop(key)
+            self.od[key] = val
+            return val
+        return None
+
+    def put(self, key: str, value):
+        if key in self.od:
+            self.od.pop(key)
+        elif len(self.od) >= self.capacity:
+            self.od.popitem(last=False)
+        self.od[key] = value
+
+answer_cache = LRUCache(CACHE_SIZE)
+
+# ---------------- util: extract vector ----------------
 def _extract_vector_from_embedding_obj(obj: Any) -> List[float]:
-    """
-    Normalize various shapes returned by google-genai SDK into List[float].
-    """
-    # direct list/tuple
     if isinstance(obj, (list, tuple)):
         return list(obj)
-    # numpy arrays (import only if needed)
     try:
-        import numpy as _np  # local import to avoid global heavy imports
+        import numpy as _np
         if isinstance(obj, _np.ndarray):
             return obj.tolist()
     except Exception:
         pass
-
-    # object attributes
     if hasattr(obj, "values"):
         vals = getattr(obj, "values")
         if isinstance(vals, (list, tuple)):
@@ -69,13 +101,11 @@ def _extract_vector_from_embedding_obj(obj: Any) -> List[float]:
         vals = getattr(obj, "embedding")
         if isinstance(vals, (list, tuple)):
             return list(vals)
-    # dict-like
     if isinstance(obj, dict):
         if "values" in obj:
             return list(obj["values"])
         if "embedding" in obj:
             return list(obj["embedding"])
-    # last resort: try to find first attr that's a sequence
     for attr in dir(obj):
         if attr.startswith("_"):
             continue
@@ -87,14 +117,8 @@ def _extract_vector_from_embedding_obj(obj: Any) -> List[float]:
             continue
     raise ValueError("Cannot extract embedding vector from object of type: %s" % type(obj))
 
-
-# ---------------- LangChain-compatible Gemini embeddings (lazy use) ----------------
+# ---------------- GeminiEmbeddings (light) ----------------
 class GeminiEmbeddings:
-    """
-    Minimal LangChain-like embeddings wrapper for google-genai (Gemini).
-    This class intentionally avoids heavy imports at module import time.
-    """
-
     def __init__(self, client, model: str = EMBED_MODEL, batch_size: int = EMBED_BATCH_SIZE):
         self.client = client
         self.model = model
@@ -121,11 +145,9 @@ class GeminiEmbeddings:
         normalized = self._normalize_texts(texts)
         all_vectors = []
         for i in range(0, len(normalized), self.batch_size):
-            batch = normalized[i : i + self.batch_size]
-            logger.debug("Embedding batch size=%d", len(batch))
+            batch = normalized[i:i + self.batch_size]
             vectors = self._embed_batch(batch)
             all_vectors.extend(vectors)
-        logger.info("embed_documents: produced %d vectors", len(all_vectors))
         return all_vectors
 
     def embed_query(self, text: str) -> List[float]:
@@ -139,90 +161,75 @@ class GeminiEmbeddings:
             return self.embed_query(texts)
         return self.embed_documents(list(texts))
 
-
-# ---------------- Optional tracemalloc enable (lazy) ----------------
+# ---------------- tracemalloc optional ----------------
 def _maybe_start_tracemalloc():
     if ENABLE_TRACEMALLOC and not _services.get("tracemalloc_enabled", False):
         try:
             import tracemalloc as _tracemalloc
             _tracemalloc.start()
             _services["tracemalloc_enabled"] = True
-            logger.info("tracemalloc started (ENABLE_TRACEMALLOC=1).")
+            logger.info("tracemalloc started.")
         except Exception as e:
             logger.exception("Failed to start tracemalloc: %s", e)
             _services["tracemalloc_enabled"] = False
 
-
-# ---------------- Lazy initialization ----------------
+# ---------------- lazy init ----------------
 def initialize_services():
-    """
-    Lazily initialize gemini client, qdrant client, embeddings, vectorstore, retriever.
-    Safe to call multiple times; protected by lock.
-    """
-    global _services_initialized, _services
-
+    global _services_initialized
     if _services_initialized:
         return
-
     with _init_lock:
         if _services_initialized:
             return
 
-        # Possibly start tracemalloc (only if env says so)
         if ENABLE_TRACEMALLOC:
             _maybe_start_tracemalloc()
 
-        # ---------- Gemini client ----------
+        # Gemini client
         try:
             if GEMINI_API_KEY:
                 from google import genai
                 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                _services["gemini_client"] = gemini_client
                 logger.info("Gemini client initialized.")
             else:
-                gemini_client = None
-                logger.warning("GEMINI_API_KEY not set; Gemini client disabled.")
-            _services["gemini_client"] = gemini_client
+                _services["gemini_client"] = None
+                logger.warning("GEMINI_API_KEY not set; gemini disabled.")
         except Exception as e:
-            logger.exception("Failed to initialize Gemini client: %s", e)
+            logger.exception("Failed to init Gemini client: %s", e)
             _services["gemini_client"] = None
 
-        # ---------- Qdrant client and vectorstore ----------
+        # Qdrant client
         lc_available = False
         if QDRANT_URL:
             try:
                 from qdrant_client import QdrantClient
                 from qdrant_client.http import models as rest_models
-                # Lazy check for LangChain's Qdrant wrapper
                 try:
                     from langchain_community.vectorstores import Qdrant as LCQdrant
                     lc_available = True
                 except Exception:
                     lc_available = False
-
                 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
                 _services["qdrant_client"] = qdrant_client
-                logger.info("Qdrant client initialized at %s", QDRANT_URL)
+                logger.info("Qdrant client initialized.")
             except Exception as e:
-                logger.exception("Failed to initialize Qdrant client: %s", e)
+                logger.exception("Failed to init Qdrant client: %s", e)
                 _services["qdrant_client"] = None
                 lc_available = False
         else:
-            logger.warning("QDRANT_URL not set; Qdrant disabled.")
             _services["qdrant_client"] = None
-            lc_available = False
 
-        # ---------- embeddings ----------
+        # embeddings wrapper
         if _services["gemini_client"]:
             try:
                 embeddings = GeminiEmbeddings(client=_services["gemini_client"], model=EMBED_MODEL)
                 _services["embeddings"] = embeddings
-                # try to detect dimension (best-effort).
                 try:
                     sample_vec = embeddings.embed_query("test embedding dimension")
                     _services["embedding_dim"] = len(sample_vec)
                     logger.info("Detected embedding dim: %d", _services["embedding_dim"])
-                except Exception as e:
-                    logger.warning("Could not detect embedding dimension automatically: %s. Proceeding without forcing collection recreation.", e)
+                except Exception:
                     _services["embedding_dim"] = None
             except Exception as e:
                 logger.exception("Failed to create embeddings wrapper: %s", e)
@@ -232,61 +239,24 @@ def initialize_services():
             _services["embeddings"] = None
             _services["embedding_dim"] = None
 
-        # ---------- collection handling (defensive, non-destructive) ----------
+        # Qdrant collection (non-destructive create if missing)
         if _services["qdrant_client"] and _services["embeddings"]:
             try:
                 from qdrant_client.http import models as rest_models
-                # get collection info if exists
                 try:
-                    col_info = _services["qdrant_client"].get_collection(collection_name=COLLECTION_NAME)
-                    existing_dim = None
-                    vectors_info = getattr(col_info, "vectors", None)
-                    if vectors_info is None and isinstance(col_info, dict):
-                        vectors_info = col_info.get("vectors")
-                    if isinstance(vectors_info, dict):
-                        existing_dim = vectors_info.get("size")
-                    else:
-                        existing_dim = getattr(vectors_info, "size", None)
-                    logger.info("Found existing collection '%s' vector size: %s", COLLECTION_NAME, existing_dim)
+                    _services["qdrant_client"].get_collection(collection_name=COLLECTION_NAME)
+                    logger.info("Qdrant collection exists: %s", COLLECTION_NAME)
                 except Exception:
-                    col_info = None
-                    existing_dim = None
-
-                # If collection not found, create it
-                if col_info is None:
-                    if _services["embedding_dim"]:
-                        try:
-                            _services["qdrant_client"].create_collection(
-                                collection_name=COLLECTION_NAME,
-                                vectors_config=rest_models.VectorParams(size=_services["embedding_dim"], distance=rest_models.Distance.COSINE),
-                            )
-                            logger.info("Created Qdrant collection '%s' with dim=%s", COLLECTION_NAME, _services["embedding_dim"])
-                        except Exception as e:
-                            logger.exception("Failed to create collection '%s': %s", COLLECTION_NAME, e)
-                    else:
-                        # If we don't know embedding dim, create with a safe default (common dims: 1536)
-                        DEFAULT_DIM = int(os.getenv("DEFAULT_EMBED_DIM", "1536"))
-                        try:
-                            _services["qdrant_client"].create_collection(
-                                collection_name=COLLECTION_NAME,
-                                vectors_config=rest_models.VectorParams(size=DEFAULT_DIM, distance=rest_models.Distance.COSINE),
-                            )
-                            logger.info("Created Qdrant collection '%s' with default dim=%d", COLLECTION_NAME, DEFAULT_DIM)
-                            if _services["embedding_dim"] is None:
-                                _services["embedding_dim"] = DEFAULT_DIM
-                        except Exception as e:
-                            logger.exception("Failed to create collection with default dim: %s", e)
-                else:
-                    # If collection exists and dims mismatch, do not delete/recreate automatically (destructive).
-                    if existing_dim and _services["embedding_dim"] and existing_dim != _services["embedding_dim"]:
-                        logger.warning(
-                            "Existing collection dimension (%s) differs from detected embedding dimension (%s). "
-                            "Will use existing collection without destructive recreate. If you want to recreate, do it manually.",
-                            existing_dim,
-                            _services["embedding_dim"],
+                    dim = _services["embedding_dim"] or int(os.getenv("DEFAULT_EMBED_DIM", "1536"))
+                    try:
+                        _services["qdrant_client"].create_collection(
+                            collection_name=COLLECTION_NAME,
+                            vectors_config=rest_models.VectorParams(size=dim, distance=rest_models.Distance.COSINE),
                         )
-
-                # Initialize LangChain Qdrant wrapper if LC is available
+                        logger.info("Created Qdrant collection '%s' dim=%d", COLLECTION_NAME, dim)
+                    except Exception as e:
+                        logger.exception("Failed to create qdrant collection: %s", e)
+                # initialize langchain wrapper if available
                 if lc_available:
                     try:
                         from langchain_community.vectorstores import Qdrant as LCQdrant
@@ -294,37 +264,27 @@ def initialize_services():
                         retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K})
                         _services["vectorstore"] = vectorstore
                         _services["retriever"] = retriever
-                        logger.info("LangChain Qdrant vectorstore initialized.")
                     except Exception as e:
-                        logger.exception("Failed to initialize LangChain Qdrant wrapper: %s", e)
+                        logger.exception("Failed to init LangChain Qdrant wrapper: %s", e)
                         _services["vectorstore"] = None
                         _services["retriever"] = None
-                else:
-                    _services["vectorstore"] = None
-                    _services["retriever"] = None
-
             except Exception as e:
-                logger.exception("Error during Qdrant/collection handling: %s", e)
-        else:
-            logger.info("Qdrant or Embeddings not available; skipping vectorstore initialization.")
+                logger.exception("Qdrant collection handling error: %s", e)
 
         _services_initialized = True
         logger.info("Service initialization complete.")
 
-
-# ---------------- Gemini LLM helper with retry ----------------
+# ---------------- Gemini LLM caller (blocking) ----------------
 def ask_gemini_with_retry(prompt: str, retries: int = 2, delay: float = 1.0, thinking_budget: int = 10) -> str:
     """
-    Best-effort wrapper to call Gemini LLM. Returns a plain text result or an error message.
+    Blocking call; will be executed inside asyncio.to_thread in the async endpoint to avoid blocking the event loop.
     """
     initialize_services()
     client = _services.get("gemini_client")
     if not client:
-        logger.warning("Gemini client not configured; returning fallback message.")
         return "⚠️ LLM not configured (GEMINI_API_KEY missing)."
 
     from google.genai import types
-
     for attempt in range(retries):
         try:
             response = client.models.generate_content(
@@ -343,9 +303,8 @@ def ask_gemini_with_retry(prompt: str, retries: int = 2, delay: float = 1.0, thi
             else:
                 return "⚠️ System busy. Please try again later."
 
-
-# ---------------- FastAPI app ----------------
-app = FastAPI(title="TarunBot API (optimized)")
+# ---------------- FastAPI ----------------
+app = FastAPI(title="TarunBot (render-guaranteed-response)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -355,75 +314,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class Query(BaseModel):
     question: str
 
-
 @app.on_event("startup")
 async def on_startup():
-    """
-    Keep startup light on serverless hosts. Services initialize lazily on first request.
-    """
-    logger.info("TarunBot API started. Services will initialize lazily on first use.")
+    # Keep startup light: do NOT call initialize_services here to avoid heavy work on health checks.
+    logger.info("TarunBot started. Services will initialize lazily on demand.")
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
 @app.get("/")
 def home():
-    return {"message": "Hello from TarunBot API (optimized)!"}
+    return {"message": "Hello from TarunBot (render-guaranteed-response)!"}
 
-
-@app.get("/test-embed")
-def test_embed():
-    """
-    Quick endpoint to test embeddings. Initializes services lazily.
-    """
-    initialize_services()
-    emb = _services.get("embeddings")
-    if not emb:
-        return {"status": "error", "error": "Embeddings not configured (GEMINI_API_KEY missing or init failed)."}
+@app.get("/memory")
+def memory(include_tracemalloc: bool = False):
     try:
-        sample_docs = ["What is the meaning of life?", "How do I bake a cake?"]
-        sample_query = "What is the purpose of existence?"
-        doc_vecs = emb.embed_documents(sample_docs)
-        query_vec = emb.embed_query(sample_query)
-        return {
-            "status": "ok",
-            "num_doc_embeddings": len(doc_vecs),
-            "doc_embedding_dim": len(doc_vecs[0]) if doc_vecs else 0,
-            "query_embedding_dim": len(query_vec),
-        }
-    except Exception as e:
-        logger.exception("Embedding test failed: %s", e)
-        return {"status": "error", "error": str(e)}
+        import psutil
+    except Exception:
+        return {"error": "psutil not installed; install with `pip install psutil`."}
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info()
+    rss = getattr(mem, "rss", None)
+    vms = getattr(mem, "vms", None)
+    resp = {
+        "pid": proc.pid,
+        "rss_bytes": rss,
+        "rss_mb": round(rss / (1024 ** 2), 2) if rss else None,
+        "vms_bytes": vms,
+        "vms_mb": round(vms / (1024 ** 2), 2) if vms else None,
+        "services_initialized": _services_initialized,
+    }
+    if include_tracemalloc and ENABLE_TRACEMALLOC and _services.get("tracemalloc_enabled", False):
+        import tracemalloc
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics("lineno")[:10]
+        top = []
+        for stat in top_stats:
+            tb = stat.traceback
+            frames = []
+            for frame in tb[:3]:
+                frames.append({"filename": frame.filename, "lineno": frame.lineno, "name": frame.name})
+            top.append({"size_bytes": stat.size, "count": stat.count, "frames": frames})
+        resp["tracemalloc_top"] = top
+    return resp
 
+# ---------------- fallback answer generator ----------------
+def _safe_fallback_answer(question: str) -> dict:
+    # Minimal, safe, non-prescriptive medical guidance
+    return {
+        "greeting": "Hello — thanks for your question.",
+        "possible_causes": "I can't access the live assistant right now. Possible causes could include common, non-urgent issues such as mild viral infections, minor injuries, or temporary irritation — depending on symptoms.",
+        "self_care": "If symptoms are mild, consider rest, hydration, and over-the-counter options like acetaminophen or ibuprofen for pain (follow product instructions). For topical issues, keep the area clean and avoid irritants.",
+        "when_to_see_doctor": "Seek medical attention if you have severe pain, difficulty breathing, high fever, worsening symptoms, sudden neurological changes, or any other urgent red flags.",
+        "closing": "Regards, AI Doctor Assistant (fallback due to high load)"
+    }
 
+# ---------------- /ask endpoint: guaranteed response ----------------
 @app.post("/ask")
 async def ask_bot(query: Query):
     """
-    Main ask endpoint:
-    - Limits concurrent requests via a semaphore to avoid memory spikes.
-    - Lazily initializes services.
-    - Uses retriever (if available) to fetch context and calls Gemini LLM.
-    - Returns JSON response parsed from LLM when possible, otherwise a fallback structure.
+    Attempts to acquire semaphore immediately (very short timeout).
+    - If acquired: run normal flow (retriever -> LLM via to_thread), cache answer, return it.
+    - If not acquired: try to return cached answer; if not cached, return safe fallback JSON immediately.
     """
+    # Do lazy init only when necessary
     initialize_services()
 
     sem: asyncio.Semaphore = _services.get("semaphore", asyncio.Semaphore(MAX_CONCURRENT_REQUESTS))
-    await sem.acquire()
+    acquired = False
     try:
+        # Immediate attempt to acquire; tiny timeout to avoid blocking
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=SEMAPHORE_WAIT_SECONDS)
+            acquired = True
+        except asyncio.TimeoutError:
+            # Busy: return cached answer or fallback
+            q_key = query.question.strip().lower()
+            cached = answer_cache.get(q_key)
+            if cached is not None:
+                logger.info("Returning cached answer for question (busy): %s", q_key)
+                # Mark that this is cached and busy
+                cached_with_meta = dict(cached)
+                cached_with_meta["_cached_fallback"] = True
+                return {"answer": cached_with_meta}
+            logger.info("No cached answer; returning safe fallback (busy).")
+            fallback = _safe_fallback_answer(query.question)
+            # include indicator so the client knows it was a fallback
+            fallback["_fallback_due_to_load"] = True
+            return {"answer": fallback}
+
+        # We got a slot: perform normal retrieval + LLM call.
         retriever = _services.get("retriever")
         context = ""
         if retriever:
             try:
-                docs = []
-                try:
-                    docs = retriever.get_relevant_documents(query.question)
-                except Exception:
+                # run retrieval in a thread to avoid blocking
+                def do_retrieve(q: str):
                     try:
-                        docs = retriever.retrieve(query.question)
+                        return retriever.get_relevant_documents(q)
                     except Exception:
-                        docs = []
+                        try:
+                            return retriever.retrieve(q)
+                        except Exception:
+                            return []
+                docs = await asyncio.to_thread(do_retrieve, query.question)
                 context = "\n".join([getattr(d, "page_content", str(d)) for d in docs]) if docs else ""
             except Exception as e:
                 logger.exception("Retriever error: %s", e)
@@ -450,12 +448,13 @@ Context:
 User Question: {query.question}
 """
 
-        raw_answer = ask_gemini_with_retry(gemini_prompt)
+        # Call the blocking LLM function in a thread
+        raw_answer = await asyncio.to_thread(ask_gemini_with_retry, gemini_prompt)
 
+        # Parse JSON if LLM returned JSON; otherwise place raw text into possible_causes
         try:
             answer_json = json.loads(raw_answer)
         except Exception:
-            logger.warning("LLM did not return valid JSON. Returning fallback JSON with raw text.")
             answer_json = {
                 "greeting": "Hello!",
                 "possible_causes": raw_answer,
@@ -464,86 +463,15 @@ User Question: {query.question}
                 "closing": "Regards, AI Doctor Assistant",
             }
 
-        return {"answer": answer_json}
-    except Exception as e:
-        logger.exception("Error in /ask endpoint: %s", e)
-        raise HTTPException(status_code=500, detail="Internal server error.")
-    finally:
-        sem.release()
-
-
-# ---------------- Memory endpoint ----------------
-@app.get("/memory")
-def memory(include_tracemalloc: bool = False):
-    """
-    Returns memory metrics for the running process.
-    - include_tracemalloc=True returns top tracemalloc stats if tracemalloc is enabled via ENABLE_TRACEMALLOC=1.
-    - This endpoint lazy-imports psutil and tracemalloc to avoid adding overhead unless requested.
-    """
-    # lazy import psutil
-    try:
-        import psutil
-    except Exception as e:
-        logger.exception("psutil is required for /memory endpoint but not installed: %s", e)
-        return {
-            "error": "psutil not installed. Install with `pip install psutil` to use this endpoint."
-        }
-
-    proc = psutil.Process(os.getpid())
-    mem = proc.memory_info()
-    rss = getattr(mem, "rss", None)
-    vms = getattr(mem, "vms", None)
-    percent = round(proc.memory_percent(), 4)
-    num_threads = proc.num_threads()
-    num_fds = None
-    try:
-        num_fds = proc.num_fds()
-    except Exception:
-        num_fds = None
-
-    resp = {
-        "pid": proc.pid,
-        "rss_bytes": rss,
-        "rss_mb": round(rss / (1024**2), 2) if rss is not None else None,
-        "vms_bytes": vms,
-        "vms_mb": round(vms / (1024**2), 2) if vms is not None else None,
-        "mem_percent": percent,
-        "threads": num_threads,
-        "open_fds": num_fds,
-        "services_initialized": _services_initialized,
-        "enabled_tracemalloc_env": ENABLE_TRACEMALLOC,
-        "tracemalloc_running": _services.get("tracemalloc_enabled", False),
-    }
-
-    # Optionally include top tracemalloc stats if enabled and requested
-    if include_tracemalloc and ENABLE_TRACEMALLOC and _services.get("tracemalloc_enabled", False):
+        # Cache the answer for future busy moments
         try:
-            import tracemalloc
-            snapshot = tracemalloc.take_snapshot()
-            top_stats = snapshot.statistics("lineno")[:10]
-            top = []
-            for stat in top_stats:
-                # format trace to something readable
-                tb = stat.traceback
-                frames = []
-                for frame in tb[:3]:  # include up to 3 frames for brevity
-                    frames.append({
-                        "filename": frame.filename,
-                        "lineno": frame.lineno,
-                        "name": frame.name,
-                    })
-                top.append({
-                    "size_bytes": stat.size,
-                    "size_kb": round(stat.size / 1024, 2),
-                    "count": stat.count,
-                    "frames": frames,
-                })
-            resp["tracemalloc_top"] = top
-        except Exception as e:
-            logger.exception("Failed to collect tracemalloc stats: %s", e)
-            resp["tracemalloc_error"] = str(e)
-    else:
-        if include_tracemalloc and not ENABLE_TRACEMALLOC:
-            resp["tracemalloc_error"] = "tracemalloc not enabled; set ENABLE_TRACEMALLOC=1 to enable."
+            q_key = query.question.strip().lower()
+            answer_cache.put(q_key, answer_json)
+        except Exception:
+            logger.exception("Failed to cache answer.")
 
-    return resp
+        # Return normal answer
+        return {"answer": answer_json}
+    finally:
+        if acquired:
+            sem.release()
